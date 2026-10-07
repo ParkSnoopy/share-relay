@@ -1,46 +1,44 @@
-# Relay protocol
+# Share HTTP protocol
 
-This is an IRC-like TCP relay, not the IRC wire protocol.
+The Rust service implements an opaque persistent bundle queue, not registration, presence or message broadcasting.
+Implementation: [src/lib.rs](./src/lib.rs); lifecycle and distribution: [LLM_WIKI.md](./LLM_WIKI.md).
+HTTP runs inside the deployment's protected transport; the relay does not terminate TLS or interpret encrypted contents.
 
-For a self-contained repository user guide, see [LLM_WIKI.md](./LLM_WIKI.md).
+## Admission
 
-NDJSON, one JSON object per line. The default bind is `0.0.0.0:6697`.
-`CHAT_RELAY_ALLOWED_HOST` is a comma-separated list of source IPs, hostnames,
-or IPv4/IPv6 CIDRs. Hostnames resolve once at startup and match their resolved
-IPs; no reverse DNS is used. An unset or empty list allows every source.
-Filtering uses the TCP peer address, before TLS or registration, without
-interface or VPN checks. Network isolation and access policy belong to the deployer.
-TLS is optional on any bind: set both `CHAT_RELAY_TLS_CERT` and
-`CHAT_RELAY_TLS_KEY` to enable it, or leave both empty for plaintext.
-Setting only one path is a configuration error.
-`.env` is loaded from the working directory;
-process environment and the CLI bind argument take precedence.
+Every endpoint requires either an exact configured source IP/DNS match or valid manager bearer authority.
+DNS is re-resolved per request under a bounded deadline; forwarded headers, reverse DNS and subnet claims are not trusted.
+An absent or empty allowed-host configuration fails startup.
+A forged bearer does not promote an admitted ordinary peer; an unadmitted peer receives `403`.
+Manager authority persists independently of clients and is not returned by the API.
 
-- Register: `{"type":"register","name":"alice"}`.
-  Names contain 1–32 Unicode alphanumeric characters, hyphens or underscores. A successful
-  registration receives `{"type":"welcome","user":"alice","token":"..."}`.
-  The 128-bit per-name token can reclaim an active or recently disconnected
-  name; every claim rotates it and closes the prior socket. Disconnected names
-  remain reserved for their token holder for 10 minutes. Up to 1,024 token
-  records are retained; an older disconnected reservation can be evicted when
-  full. Any admitted peer can claim an unreserved name, so names are not
-  durable identities.
-- Message: `{"type":"msg","payload":...,"to":["bob","carol"]}` or
-  `{"type":"msg","payload":...,"broadcast":true}`. `payload` can be any JSON
-  value; the relay never interprets it. `to` requires 1–64 valid names. If any
-  name is unavailable, nobody receives the message. Duplicate names and the
-  sender each receive one copy. The server stamps `from`; directed messages
-  reach only the sender and named recipients. Broadcast must be explicit per
-  message and does not persist between connections. Only routing fields are
-  allowed outside `payload`. `CHAT_RELAY_MAX_CONTENT_SIZE` limits each incoming
-  NDJSON line in bytes, excluding its newline (default 256 KiB); larger
-  payloads require multiple messages. This is not a cumulative transfer limit.
-  Both routes echo to sender.
-- `{"type":"users"}` lists live names; `{"type":"ping"}` gets `pong`.
-  Registration must finish within 10 seconds; registered connections close
-  after 5 minutes without a complete line. TLS handshakes and blocked writes
-  time out after 10 seconds. Slow receivers are disconnected; at most 64
-  connections and eight queued messages per connection are admitted.
+## Endpoints
 
-The relay does not inspect, log, or persist payloads. It cannot verify their
-application-level properties; those belong outside the relay protocol.
+| Method and path | Request | Success |
+| --- | --- | --- |
+| `GET /policy` | No body | `200`, JSON `manager` boolean and `userRetentionHours` integer |
+| `GET /items` | No body | `200`, JSON array of unexpired items, newest creation first, ID ascending for ties |
+| `POST /items?title=…&kind=…&hours=…` | Raw binary ciphertext, content length or chunked transfer | `201`, committed item JSON |
+| `GET /items/{id}` | Lowercase 32-hex ID | `200`, `application/octet-stream`, exact `Content-Length` |
+
+Item fields are `id`, `title`, `kind`, `size`, `created`, `expires`, and `manager`.
+Times are Unix seconds; `expires=0` means no expiry.
+`retentionAdjusted=true` appears only in an upload response when retention was clamped; it is not persistent metadata.
+Titles are trimmed, nonempty, at most 512 UTF-8 bytes, and contain no control characters.
+Kinds are `files` and `configuration`; configuration publication requires manager authority.
+Hours must be a nonnegative signed 64-bit integer.
+Ordinary zero/unlimited or above-72-hour requests are clamped to 72 hours before duration arithmetic.
+Managers may request zero or longer retention within the existing signed-nanosecond duration bound.
+
+## Failure and storage semantics
+
+Errors have fixed public text bodies: invalid input or incomplete upload `400`, denied source or publication `403`, absent/expired item or unsupported route/method `404`, concurrent upload `409`, upload deadline `408`, storage failure `503`, and quota/catalog exhaustion `507`.
+Responses include `Cache-Control: no-store` and `X-Content-Type-Options: nosniff`.
+Uploads stream into private temporary storage, synchronize data and metadata, then publish by atomic directory rename.
+Only one upload reserves quota at a time; reads continue independently.
+The aggregate ciphertext quota and 512-item catalog limit are server-enforced.
+Abandoned uploads are cleaned on startup; expired items are removed on inventory access and periodic sweeping.
+Queue data and manager authority survive service restart and client disconnect.
+Downloads do not consume or delete items.
+An interrupted response can leave a committed upload; clients must read back the catalog before retrying, because POST is not idempotent.
+The server stores opaque bytes and public metadata; it cannot validate encryption, passwords, archives or application-specific configuration contents.
